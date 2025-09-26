@@ -99,3 +99,33 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# Additional entries for this project
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+ehthumbs.db
+Thumbs.db
+*.exe
+*.msi
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary and backup files
+tmp/
+temp/
+*_old.*
+*_backup.*
+
+# Project specific
+README_old.md
