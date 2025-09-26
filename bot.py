@@ -30,8 +30,10 @@ redis_available = False
 
 try:
     redis_url = os.getenv('REDIS_URL')
+    logger.info(f"Redis URL found: {'Yes' if redis_url else 'No'}")
+    
     if redis_url:
-        # Parse Redis URL and handle SSL for Heroku
+        logger.info(f"Redis URL type: {'SSL' if 'rediss://' in redis_url else 'Standard'}")
         
         # For Heroku Redis, we need SSL and longer timeouts
         if 'rediss://' in redis_url:
@@ -43,7 +45,8 @@ try:
                 socket_connect_timeout=30,
                 socket_keepalive=True,
                 socket_keepalive_options={},
-                health_check_interval=30
+                health_check_interval=30,
+                retry_on_timeout=True
             )
         else:
             # Standard Redis connection
@@ -51,7 +54,8 @@ try:
                 redis_url, 
                 decode_responses=True,
                 socket_timeout=10,
-                socket_connect_timeout=10
+                socket_connect_timeout=10,
+                retry_on_timeout=True
             )
         
         # Test connection with retry
@@ -77,6 +81,9 @@ try:
                 test_value = redis_client.get('test_connection')
                 if test_value == 'ok':
                     logging.info("Redis read/write test successful")
+                    # 测试基本数据操作
+                    redis_client.set('bot_status', 'online', ex=3600)
+                    logging.info("Redis bot status set successfully")
                 else:
                     logging.warning("Redis read test failed")
             except Exception as e:
@@ -162,32 +169,6 @@ def send_help(message):
     """
     bot.reply_to(message, help_text)
 
-@bot.message_handler(commands=['info'])
-def send_info(message):
-    """Handle /info command"""
-    user_count = 0
-    if redis_client:
-        try:
-            # Get user count from Redis
-            user_count = redis_client.scard("bot_users") or 0
-            # Add current user to set
-            redis_client.sadd("bot_users", message.from_user.id)
-        except:
-            pass
-    
-    info_text = f"""
-ℹ️ 机器人信息
-
-• 版本: 2.0
-• 运行环境: Heroku/Cloud
-• Python版本: 3.11+
-• 用户数量: {user_count}
-• Redis状态: {"✅ 已连接" if redis_client else "❌ 未连接"}
-
-Bot ID: @{bot.get_me().username}
-    """
-    bot.reply_to(message, info_text)
-
 @bot.message_handler(commands=['echo'])
 def echo_message(message):
     """Handle /echo command"""
@@ -197,6 +178,74 @@ def echo_message(message):
         bot.reply_to(message, f"🔄 你说: {text}")
     else:
         bot.reply_to(message, "请在/echo后面添加要回显的消息")
+
+@bot.message_handler(commands=['info'])
+def send_info(message):
+    """Handle /info command"""
+    user_count = 0
+    redis_status = "❌ 未连接"
+    redis_details = ""
+    redis_error_info = ""
+    
+    # 获取环境变量状态
+    redis_url = os.getenv('REDIS_URL')
+    redis_url_status = "✅ 已设置" if redis_url else "❌ 未设置"
+    
+    if redis_url:
+        redis_details += f"\n🔗 Redis URL前缀: {redis_url[:30]}..."
+    
+    if redis_available and redis_client:
+        try:
+            # 测试Redis连接
+            ping_result = redis_client.ping()
+            if ping_result:
+                redis_status = "✅ 已连接"
+                
+                # 获取用户数量
+                try:
+                    user_count = redis_client.scard('bot_users') or 0
+                    redis_client.sadd('bot_users', message.from_user.id)
+                except Exception as e:
+                    redis_details += f"\n⚠️ 用户数据读取错误: {str(e)[:50]}"
+                
+                # 获取Redis信息
+                try:
+                    redis_info = redis_client.info()
+                    redis_version = redis_info.get('redis_version', 'unknown')
+                    memory_used = redis_info.get('used_memory_human', 'unknown')
+                    connected_clients = redis_info.get('connected_clients', 'unknown')
+                    redis_details += f"\n📊 Redis版本: {redis_version}"
+                    redis_details += f"\n💾 内存使用: {memory_used}"
+                    redis_details += f"\n👥 连接数: {connected_clients}"
+                except Exception as e:
+                    redis_details += f"\n⚠️ Redis信息获取失败: {str(e)[:50]}"
+                    
+        except redis.ConnectionError as e:
+            redis_status = "❌ 连接失败"
+            redis_error_info = f"\n🔍 连接错误: {str(e)[:100]}"
+        except redis.TimeoutError as e:
+            redis_status = "❌ 连接超时"
+            redis_error_info = f"\n🔍 超时错误: {str(e)[:100]}"
+        except Exception as e:
+            redis_status = "❌ 未知错误"
+            redis_error_info = f"\n🔍 错误详情: {str(e)[:100]}"
+    elif redis_url:
+        redis_status = "❌ 初始化失败"
+        redis_error_info = "\n🔍 Redis客户端初始化失败，检查启动日志"
+    
+    info_text = f"""
+ℹ️ 机器人信息
+
+• 版本: 2.0
+• 运行环境: Heroku/Cloud  
+• Python版本: 3.11+
+• 用户数量: {user_count}
+• Redis状态: {redis_status}
+• 环境变量: {redis_url_status}{redis_details}{redis_error_info}
+
+Bot ID: @{bot.get_me().username}
+    """
+    bot.reply_to(message, info_text)
 
 @bot.message_handler(commands=['weather'])
 def get_weather(message):
@@ -341,7 +390,7 @@ def show_stats(message):
     message_count = 0
     join_date = "未知"
     
-    if redis_client:
+    if redis_available and redis_client:
         try:
             message_count = redis_client.get(f"user:{user_id}:messages") or 0
             join_date_timestamp = redis_client.get(f"user:{user_id}:join_date")
@@ -352,8 +401,8 @@ def show_stats(message):
                 redis_client.set(f"user:{user_id}:join_date", join_date)
             else:
                 join_date = join_date_timestamp.decode() if isinstance(join_date_timestamp, bytes) else join_date_timestamp
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Redis stats operation failed: {e}")
     
     stats_text = f"""
 📊 {user_name} 的使用统计
@@ -373,14 +422,15 @@ def handle_feedback(message):
     feedback = message.text[10:].strip()  # Remove '/feedback ' from beginning
     if feedback:
         # 这里可以将反馈保存到数据库或发送给管理员
-        if redis_client:
+        if redis_available and redis_client:
             try:
                 import time
                 feedback_key = f"feedback:{int(time.time())}:{message.from_user.id}"
                 feedback_data = f"User: {message.from_user.first_name} ({message.from_user.id})\nFeedback: {feedback}"
                 redis_client.set(feedback_key, feedback_data)
-            except:
-                pass
+                logger.info(f"Feedback saved: {feedback_key}")
+            except Exception as e:
+                logger.warning(f"Failed to save feedback: {e}")
         
         response = """
 📝 反馈已收到！
@@ -400,12 +450,12 @@ def handle_all_messages(message):
     user_name = message.from_user.first_name or "朋友"
     
     # Store user interaction in Redis if available
-    if redis_client:
+    if redis_available and redis_client:
         try:
             redis_client.sadd("bot_users", message.from_user.id)
             redis_client.incr(f"user:{message.from_user.id}:messages")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to update user stats: {e}")
     
     # Enhanced message processing based on content
     text = message.text.lower() if message.text else ""
@@ -512,62 +562,11 @@ def handle_media(message):
     media_type = media_types.get(message.content_type, '📎 媒体文件')
     bot.reply_to(message, f"收到你发送的{media_type}！感谢分享！")
 
-# 找到handle_info命令函数，更新Redis状态显示：
-
-@bot.message_handler(commands=['info'])
-def handle_info(message):
-    """显示机器人信息和状态"""
-    try:
-        user_count = 0
-        redis_status = "❌ 未连接"
-        redis_details = ""
-        
-        if redis_available and redis_client:
-            try:
-                # 测试Redis连接
-                redis_client.ping()
-                user_count = len(redis_client.smembers('telegram_users') or set())
-                redis_status = "✅ 已连接"
-                
-                # 获取Redis信息
-                redis_info = redis_client.info()
-                redis_version = redis_info.get('redis_version', 'unknown')
-                memory_used = redis_info.get('used_memory_human', 'unknown')
-                redis_details = f"\n📊 Redis版本: {redis_version}\n💾 内存使用: {memory_used}"
-                
-            except Exception as e:
-                redis_status = f"❌ 连接错误: {str(e)[:50]}"
-                redis_details = f"\n🔍 错误详情: {str(e)}"
-        
-        # 获取环境变量状态
-        redis_url_status = "✅ 已设置" if os.getenv('REDIS_URL') else "❌ 未设置"
-        
-        info_text = f"""
-🤖 <b>机器人状态信息</b>
-
-📱 <b>基本信息</b>
-• 版本: v2.0.0
-• 运行状态: ✅ 正常
-• 部署平台: Heroku
-
-👥 <b>用户统计</b>
-• 注册用户数: {user_count}
-
-🔧 <b>Redis状态</b>
-• 连接状态: {redis_status}
-• 环境变量: {redis_url_status}{redis_details}
-
-💡 如需帮助，请使用 /help
-"""
-        
-        bot.send_message(message.chat.id, info_text, parse_mode='HTML')
-        
-    except Exception as e:
-        logging.error(f"Info command error: {e}")
-        bot.send_message(message.chat.id, f"获取信息时出错: {e}")
-
 if __name__ == "__main__":
     logger.info("Starting Telegram Bot...")
+    logger.info(f"Redis available: {redis_available}")
+    logger.info(f"Redis URL configured: {'Yes' if os.getenv('REDIS_URL') else 'No'}")
+    
     try:
         # Start polling
         bot.infinity_polling(none_stop=True)
