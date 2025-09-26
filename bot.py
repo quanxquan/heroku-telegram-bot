@@ -5,6 +5,7 @@ import telebot
 import logging
 import time
 import urllib.parse
+import ssl
 
 # Load environment variables from .env file for local development (only if file exists)
 try:
@@ -37,17 +38,54 @@ try:
         
         # For Heroku Redis, we need SSL and longer timeouts
         if 'rediss://' in redis_url:
-            # Heroku Redis uses SSL
-            redis_client = redis.from_url(
-                redis_url, 
-                decode_responses=True,
-                socket_timeout=30,
-                socket_connect_timeout=30,
-                socket_keepalive=True,
-                socket_keepalive_options={},
-                health_check_interval=30,
-                retry_on_timeout=True
-            )
+            # Heroku Redis uses SSL - try different approaches
+            logger.info("Attempting Heroku Redis SSL connection...")
+            
+            # Method 1: Try with SSL verification disabled
+            try:
+                redis_client = redis.from_url(
+                    redis_url, 
+                    decode_responses=True,
+                    socket_timeout=30,
+                    socket_connect_timeout=30,
+                    retry_on_timeout=True,
+                    ssl_cert_reqs=ssl.CERT_NONE,
+                    ssl_check_hostname=False
+                )
+                logger.info("Redis client created with SSL verification disabled")
+            except Exception as e:
+                logger.warning(f"SSL method 1 failed: {e}")
+                
+                # Method 2: Try with connection pool
+                try:
+                    import redis.connection
+                    pool = redis.ConnectionPool.from_url(
+                        redis_url,
+                        ssl_cert_reqs=ssl.CERT_NONE,
+                        ssl_check_hostname=False,
+                        socket_timeout=30,
+                        socket_connect_timeout=30
+                    )
+                    redis_client = redis.Redis(connection_pool=pool, decode_responses=True)
+                    logger.info("Redis client created with connection pool")
+                except Exception as e2:
+                    logger.warning(f"SSL method 2 also failed: {e2}")
+                    
+                    # Method 3: Try converting to non-SSL (fallback)
+                    try:
+                        non_ssl_url = redis_url.replace('rediss://', 'redis://')
+                        logger.warning("Attempting fallback to non-SSL connection")
+                        redis_client = redis.from_url(
+                            non_ssl_url, 
+                            decode_responses=True,
+                            socket_timeout=30,
+                            socket_connect_timeout=30,
+                            retry_on_timeout=True
+                        )
+                        logger.info("Redis client created with non-SSL fallback")
+                    except Exception as e3:
+                        logger.error(f"All connection methods failed. Last error: {e3}")
+                        raise e  # Re-raise original exception
         else:
             # Standard Redis connection
             redis_client = redis.from_url(
@@ -91,10 +129,21 @@ try:
     else:
         logging.warning("REDIS_URL not found in environment variables")
         
-except ImportError:
-    logging.error("Redis module not found. Install with: pip install redis")
+except ImportError as e:
+    logger.error(f"Redis module not found: {e}. Install with: pip install redis")
+    redis_client = None
+    redis_available = False
+except ssl.SSLError as e:
+    logger.error(f"Redis SSL connection error: {e}")
+    redis_client = None
+    redis_available = False
+except redis.ConnectionError as e:
+    logger.error(f"Redis connection error: {e}")
+    redis_client = None
+    redis_available = False
 except Exception as e:
-    logging.error(f"Redis connection error: {e}")
+    logger.error(f"Redis initialization error: {e}")
+    logger.error(f"Error type: {type(e).__name__}")
     redis_client = None
     redis_available = False
 
