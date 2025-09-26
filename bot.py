@@ -3,6 +3,8 @@ import redis
 import os
 import telebot
 import logging
+import time
+import urllib.parse
 
 # Load environment variables from .env file for local development (only if file exists)
 try:
@@ -22,17 +24,72 @@ if not token:
     logger.error("TELEGRAM_TOKEN environment variable is not set!")
     exit(1)
 
-# Optional: Redis setup for data persistence
-redis_url = os.environ.get("REDIS_URL")
-r = None
-if redis_url:
-    try:
-        r = redis.from_url(redis_url)
-        r.ping()  # Test connection
-        logger.info("Redis connection established")
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
-        r = None
+# Redis configuration
+redis_client = None
+redis_available = False
+
+try:
+    redis_url = os.getenv('REDIS_URL')
+    if redis_url:
+        # Parse Redis URL and handle SSL for Heroku
+        
+        # For Heroku Redis, we need SSL and longer timeouts
+        if 'rediss://' in redis_url:
+            # Heroku Redis uses SSL
+            redis_client = redis.from_url(
+                redis_url, 
+                decode_responses=True,
+                socket_timeout=30,
+                socket_connect_timeout=30,
+                socket_keepalive=True,
+                socket_keepalive_options={},
+                health_check_interval=30
+            )
+        else:
+            # Standard Redis connection
+            redis_client = redis.from_url(
+                redis_url, 
+                decode_responses=True,
+                socket_timeout=10,
+                socket_connect_timeout=10
+            )
+        
+        # Test connection with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                redis_client.ping()
+                redis_available = True
+                logging.info(f"Redis connected successfully (attempt {attempt + 1})")
+                break
+            except redis.ConnectionError as e:
+                logging.warning(f"Redis connection attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    redis_client = None
+                    redis_available = False
+                else:
+                    time.sleep(2)  # Wait before retry
+        
+        if redis_available:
+            # Test write operation
+            try:
+                redis_client.set('test_connection', 'ok', ex=60)
+                test_value = redis_client.get('test_connection')
+                if test_value == 'ok':
+                    logging.info("Redis read/write test successful")
+                else:
+                    logging.warning("Redis read test failed")
+            except Exception as e:
+                logging.warning(f"Redis read/write test failed: {e}")
+    else:
+        logging.warning("REDIS_URL not found in environment variables")
+        
+except ImportError:
+    logging.error("Redis module not found. Install with: pip install redis")
+except Exception as e:
+    logging.error(f"Redis connection error: {e}")
+    redis_client = None
+    redis_available = False
 
 # Initialize bot
 bot = telebot.TeleBot(token)
@@ -109,12 +166,12 @@ def send_help(message):
 def send_info(message):
     """Handle /info command"""
     user_count = 0
-    if r:
+    if redis_client:
         try:
             # Get user count from Redis
-            user_count = r.scard("bot_users") or 0
+            user_count = redis_client.scard("bot_users") or 0
             # Add current user to set
-            r.sadd("bot_users", message.from_user.id)
+            redis_client.sadd("bot_users", message.from_user.id)
         except:
             pass
     
@@ -125,7 +182,7 @@ def send_info(message):
 • 运行环境: Heroku/Cloud
 • Python版本: 3.11+
 • 用户数量: {user_count}
-• Redis状态: {"✅ 已连接" if r else "❌ 未连接"}
+• Redis状态: {"✅ 已连接" if redis_client else "❌ 未连接"}
 
 Bot ID: @{bot.get_me().username}
     """
@@ -284,15 +341,15 @@ def show_stats(message):
     message_count = 0
     join_date = "未知"
     
-    if r:
+    if redis_client:
         try:
-            message_count = r.get(f"user:{user_id}:messages") or 0
-            join_date_timestamp = r.get(f"user:{user_id}:join_date")
+            message_count = redis_client.get(f"user:{user_id}:messages") or 0
+            join_date_timestamp = redis_client.get(f"user:{user_id}:join_date")
             if not join_date_timestamp:
                 # 首次使用，记录加入日期
                 from datetime import datetime
                 join_date = datetime.now().strftime("%Y-%m-%d")
-                r.set(f"user:{user_id}:join_date", join_date)
+                redis_client.set(f"user:{user_id}:join_date", join_date)
             else:
                 join_date = join_date_timestamp.decode() if isinstance(join_date_timestamp, bytes) else join_date_timestamp
         except:
@@ -316,12 +373,12 @@ def handle_feedback(message):
     feedback = message.text[10:].strip()  # Remove '/feedback ' from beginning
     if feedback:
         # 这里可以将反馈保存到数据库或发送给管理员
-        if r:
+        if redis_client:
             try:
                 import time
                 feedback_key = f"feedback:{int(time.time())}:{message.from_user.id}"
                 feedback_data = f"User: {message.from_user.first_name} ({message.from_user.id})\nFeedback: {feedback}"
-                r.set(feedback_key, feedback_data)
+                redis_client.set(feedback_key, feedback_data)
             except:
                 pass
         
@@ -343,10 +400,10 @@ def handle_all_messages(message):
     user_name = message.from_user.first_name or "朋友"
     
     # Store user interaction in Redis if available
-    if r:
+    if redis_client:
         try:
-            r.sadd("bot_users", message.from_user.id)
-            r.incr(f"user:{message.from_user.id}:messages")
+            redis_client.sadd("bot_users", message.from_user.id)
+            redis_client.incr(f"user:{message.from_user.id}:messages")
         except:
             pass
     
@@ -454,6 +511,60 @@ def handle_media(message):
     
     media_type = media_types.get(message.content_type, '📎 媒体文件')
     bot.reply_to(message, f"收到你发送的{media_type}！感谢分享！")
+
+# 找到handle_info命令函数，更新Redis状态显示：
+
+@bot.message_handler(commands=['info'])
+def handle_info(message):
+    """显示机器人信息和状态"""
+    try:
+        user_count = 0
+        redis_status = "❌ 未连接"
+        redis_details = ""
+        
+        if redis_available and redis_client:
+            try:
+                # 测试Redis连接
+                redis_client.ping()
+                user_count = len(redis_client.smembers('telegram_users') or set())
+                redis_status = "✅ 已连接"
+                
+                # 获取Redis信息
+                redis_info = redis_client.info()
+                redis_version = redis_info.get('redis_version', 'unknown')
+                memory_used = redis_info.get('used_memory_human', 'unknown')
+                redis_details = f"\n📊 Redis版本: {redis_version}\n💾 内存使用: {memory_used}"
+                
+            except Exception as e:
+                redis_status = f"❌ 连接错误: {str(e)[:50]}"
+                redis_details = f"\n🔍 错误详情: {str(e)}"
+        
+        # 获取环境变量状态
+        redis_url_status = "✅ 已设置" if os.getenv('REDIS_URL') else "❌ 未设置"
+        
+        info_text = f"""
+🤖 <b>机器人状态信息</b>
+
+📱 <b>基本信息</b>
+• 版本: v2.0.0
+• 运行状态: ✅ 正常
+• 部署平台: Heroku
+
+👥 <b>用户统计</b>
+• 注册用户数: {user_count}
+
+🔧 <b>Redis状态</b>
+• 连接状态: {redis_status}
+• 环境变量: {redis_url_status}{redis_details}
+
+💡 如需帮助，请使用 /help
+"""
+        
+        bot.send_message(message.chat.id, info_text, parse_mode='HTML')
+        
+    except Exception as e:
+        logging.error(f"Info command error: {e}")
+        bot.send_message(message.chat.id, f"获取信息时出错: {e}")
 
 if __name__ == "__main__":
     logger.info("Starting Telegram Bot...")
